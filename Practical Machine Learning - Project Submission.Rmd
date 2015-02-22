@@ -1,0 +1,216 @@
+## Title: Application of Machine Learning to assessing correctness of performing weight lifting exercises
+
+Author: S. Begwani
+
+### Overview
+
+The "quantified self" movement consists of people taking measurements of their physical parameters regularly to improve health, discover any repeating patterns, etc. Most studies focus on how much of a particular activity was performed, but do not consider how effectively it was performed. For the purpose of this assignment, we consider a data set from http://groupware.les.inf.puc-rio.br/har (Weight Lifting Exercise data set). 
+
+In this study, participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways under the supervised guidance of an experienced weight lifter. Data was collected from accelerometers on the belt, forearm, arm, and dumbbell of the 6 participants.
+
+The training and the test data set have been made available for this assignment. Model building will be done on the training data set, and then the final model will be used to make predictions for the 20 test cases.
+
+### Preliminary Analysis and Data Cleaning
+
+The following code assumes that the pml-training.csv, and the pml-testing.csv files are in the current working directory. The current working directory can be set using the setwd() command.
+
+The training data is loaded. Clearly, a lot of the columns have missing values. To clean the data set, first we eliminate columns where 75% or more values are 'NA' or missing or "". It would not be wise to try imputation of values for these columns.
+
+
+```{r}
+## Load the training data set
+trainData <- read.csv("pml-training.csv", header=TRUE,
+                      na.strings="NA", stringsAsFactors=TRUE)
+dim(trainData)
+
+columnCollect <- integer() ## Store the column numbers
+## for those columns where 75% or more values are "NA" or NULL or ""
+for (i in 1:ncol(trainData))
+{
+  noEmpty <- sum(is.na(trainData[[i]]) | is.null(trainData[[i]]) 
+                 | trainData[[i]]=="")
+  percEmpty <- noEmpty/(nrow(trainData))
+  if (percEmpty>=0.75) columnCollect <- c(columnCollect,i)  
+}
+
+trainData <- trainData[,-columnCollect] ## Remove very sparse columns
+dim(trainData) ## The output shows that nearly 100 columns have been removed
+
+
+## We now perform a quick check to see how many NA values remain in the data
+## The results show there are no such values
+any(is.na(trainData))
+
+```
+
+Next, the data set is examined to see if there are any variables with near zero variance. Also, it is important to examine if there are factor variables which have a huge dominance of one class value over others. This can be seen through the frequency ratio of the most commonly occuring class value to the next commonly occurring class value. While there are no clear guidelines, if the ratio is above 50, it indicates that the distribution of levels within that factor is very highly skewed, and this can create problems in analysis. In particular, algorithms will find it very difficult to maintain equal class distribution (distribution of different levels within a factor) between the training and validation set.
+
+```{r}
+library(caret)
+zeroVar <- nearZeroVar(trainData, saveMetrics=TRUE)
+k <- zeroVar[zeroVar$freqRatio>=50 | zeroVar$nzv==TRUE,]
+k
+trainData <- trainData[,- which(names(trainData) %in% rownames(k))] 
+
+```
+
+As can be seen, four variables qualify. These variables are removed from the training set.
+
+Finally, by manual inspection, we can remove some variables as they are unlikely to have any bearing on the value of the "classe" variable. These variables are:
+
+First column - serial number of rows
+user_name - The specific user does not matter as the volunteers performed the exercises and simulated the mistakes under the supervision of an experienced weight lifter as mentioned in the write-up at http://groupware.les.inf.puc-rio.br/har. 
+raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp - There is no reason to believe that the timing of the exercise had anything to do with the results
+
+We eliminate these columns via the following code:
+
+```{r}
+trainData <- trainData[,-(1:5)] ## As the abovementioned columns are contiguous
+```
+
+### Principal Components Analysis
+
+The trainData data set now has 19622 cases with each case having 51 variables.
+
+Before undertaking PCA, we examine how correlated the different variables are. In particular, we examine which variables have a correlation of more than 0.8.
+
+```{r}
+M <- abs(cor(trainData[,-51])) ## creates a matrix where the diagonal acts as a mirror for the two sides
+diag(M) <- 0 ## Setting the diagonal terms to zero
+nrow (which(M>0.8,arr.ind=TRUE)) / 2 ## Number of distinct variable pairs that are correlated
+```
+
+As can be seen from the output, 19 pairs of variables are highly correlated. A PCA approach can produce a huge reduction in the number of variables while still capturing most of the variation in the data.
+
+In order to perform PCA, it is important that the data must be near-Gaussian. The predictor variables will be centered and scaled to achieve this. For this, it must be checked whether all the predictor variables are integer or numeric. Note: We cannot use logarithmic, or Box-Cox transformations as several variables have negative values. 
+
+
+```{r}
+all(sapply(trainData[,-51],class)=="integer" 
+    | sapply(trainData[,-51],class)=="numeric")
+```
+
+Since we have all predictor variables of type numeric or integer, we can now apply principal component analysis.
+
+We shall use the preProcess() function, using method="pca", and aim for retention of 90% variation in data by setting the thresh parameter to 0.90.
+
+Retaining only 90% of the variation potentially means that we are throwing away some valuable information. The threshold can be set to higher values, say 0.95, or even 0.99 as it would probably be in real-life applications. However, the number of principal components, and hence the data size, increases, and this causes memory issues on my machine when running a bagged classification tree (this is explained later).
+
+As such, with only 90% of the variance in data retained, it is logical to assume that the out-of-sample error rate will be greater than 10% or the accuracy will be less than 90% on out-of-sample data - more accurate predictions of out-of-sample errors will be ascertained during the model fit process.
+
+
+
+```{r}
+train1Data <- trainData ## Create a copy of trainData
+
+preProc <- preProcess(train1Data[,-51],method=c("center","scale","pca"), 
+                      thresh=0.90)
+train1Data <- predict(preProc,train1Data[,-51])
+ncol(train1Data)
+```
+
+The number of principal components required to retain a variance of 90% is 18 as shown by the code above.
+
+### Model Fitting, Cross-Validation and Final Model
+
+A bagged classification tree is fitted to the training data. For this, the training data is partitioned 60:40 between the training set and the validation set. Since the test set is separate, the model would not be biased by training the model on the training set and subequently validating against the cross-validation set to find the best-fit model.
+
+In this case, we change the value of the number of bags, B, to ascertain the best model. In the bagging approach, the number of trees B is a free parameter that can be optimized.
+
+In this case, the model is fitted for values of B between 5 and 9. Due to memory constraints, values above 9 cannot be evaluated, as a 9-bag model consumes about 3 GB of physical memory.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(333)
+inTrain <- createDataPartition(y=trainData$classe,p=0.6,list=FALSE)
+trainingSet <- train1Data[inTrain,]
+validationSet <- train1Data[-inTrain,]
+
+## The model is fitted for bag values, B, between 5 to 9.
+modelTable <- data.frame()
+
+for (i in 5:9)
+{
+  ## Fit the model
+  treebag <- bag(trainingSet, trainData[inTrain,]$classe, B=i,
+                 bagControl = bagControl(fit = ctreeBag$fit, 
+                                         predict=ctreeBag$pred, 
+                                         aggregate=ctreeBag$aggregate))
+  ## Calculate the confusion matrix
+  
+  predictedValues <- predict(treebag,validationSet)
+  trueValues <- trainData[-inTrain,]$classe
+  confMat <- confusionMatrix(predictedValues,trueValues)
+  
+  ## Store in the data frame
+  
+  modelTable <- rbind(modelTable, c(i, confMat$overall["Accuracy"]))
+  
+  ## Remove the existing bagged model to free up space for the next run
+  
+  rm(treebag)
+  
+}
+
+colnames(modelTable) <- c("Number of Bags", "Accuracy")
+modelTable
+```
+
+
+
+
+As can be seen from the above table, the accuracy increases with the number of bags employed. A value of B=9 is chosen to construct the final model.
+
+With a value of B=9, the accuracy of the model is about 86%. This is also what the estimated out-of-sample accuracy rate for the final model is likely to be. In other words, the expectation is that the final model will have an error rate of around 15%, or in the case of this specific assignment, this model should classify approximately 17 of the 20 cases correctly in the testing data set.
+
+** IMPORTANT: While fitting the final model, the entire training data set must be utilized. However, that would lead to an increase in data size (100% as opposed to 60% of the training set), and the memory requirements would increase sizeably. In this analysis, the final model with B=9 is derived from 60% of the training set as was done in the code above.
+
+```{r message=FALSE, warning=FALSE}
+finalModel <- bag(trainingSet, trainData[inTrain,]$classe, B=9,
+                 bagControl = bagControl(fit = ctreeBag$fit, 
+                                         predict=ctreeBag$pred, 
+                                         aggregate=ctreeBag$aggregate))
+```
+
+
+### Predicting values for the testing set
+
+Before predicting values, we will have to first apply the same data cleaning and preprocessing steps to the testing data set. Then, we make the predictions for the 20 test cases.
+
+```{r}
+testData <- read.csv("pml-testing.csv", header=TRUE,
+                      na.strings="NA", stringsAsFactors=TRUE)
+dim(testData)
+
+## Remove the columns which were removed in the training set
+
+testData <- testData[,-columnCollect]
+testData <- testData[,- which(names(testData) %in% rownames(k))]
+testData <- testData[,-(1:5)]
+
+## Quick check to see dimensions of the test set and presence of NA values
+
+dim(testData)
+any(is.na(testData))
+
+## The test data set has no missing values, but the number of columns is 
+## 51 despite not having the classe variable.
+## A quick look at the test data set reveals that the last column is
+## problem_id, which can be removed
+
+testData <- testData[,-ncol(testData)]
+dim(testData)
+
+## Apply preprocessing step using the preProc object created 
+## with the training set
+
+test1Data <- predict(preProc,testData)
+
+## We can now make predictions using our final fitted model
+
+predict(finalModel,test1Data)
+
+```
+
+
+
+
